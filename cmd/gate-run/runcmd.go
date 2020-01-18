@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"debug/dwarf"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -90,6 +92,8 @@ type Config struct {
 		Repeat int
 		Timing bool
 	}
+
+	Breakpoints []string
 
 	Dump string
 }
@@ -276,7 +280,7 @@ func execute(ctx context.Context, executor *runtime.Executor, filename string, s
 	var ns = new(section.NameSection)
 	var cs = new(section.CustomSections)
 
-	funcSigs, prog, inst, buffers, err := load(filename, &im, ns, cs)
+	debugInfo, funcSigs, prog, inst, buffers, err := load(filename, &im, ns, cs)
 	if err != nil {
 		log.Fatalf("load: %v", err)
 	}
@@ -346,23 +350,33 @@ func execute(ctx context.Context, executor *runtime.Executor, filename string, s
 		}
 	}
 
-	debugInfo, err := newDWARF(cs.Sections)
-	if err != nil {
-		log.Printf("dwarf: %v", err) // Not fatal
-	}
-
 	if len(trace) > 0 {
 		stacktrace.Fprint(os.Stderr, trace, funcSigs, ns, debugInfo)
 	}
 }
 
 func load(filename string, codeMap *debug.InsnMap, ns *section.NameSection, cs *section.CustomSections,
-) (funcSigs []wa.FuncType, prog *image.Program, inst *image.Instance, buffers snapshot.Buffers, err error) {
+) (debugInfo *dwarf.Data, funcSigs []wa.FuncType, prog *image.Program, inst *image.Instance, buffers snapshot.Buffers, err error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return
 	}
 	defer f.Close()
+
+	debugInfo, err = loadDebugInfo(bufio.NewReader(f))
+	if err != nil {
+		return
+	}
+
+	breakpoints, err := parseBreakpoints(debugInfo)
+	if err != nil {
+		return
+	}
+
+	_, err = f.Seek(0, io.SeekStart)
+	if err != nil {
+		return
+	}
 
 	info, err := f.Stat()
 	if err != nil {
@@ -376,14 +390,9 @@ func load(filename string, codeMap *debug.InsnMap, ns *section.NameSection, cs *
 	defer b.Close()
 
 	b.Loaders["name"] = ns.Load
-	b.Loaders[".debug_abbrev"] = cs.Load
-	b.Loaders[".debug_info"] = cs.Load
-	b.Loaders[".debug_line"] = cs.Load
-	b.Loaders[".debug_pubnames"] = cs.Load
-	b.Loaders[".debug_ranges"] = cs.Load
-	b.Loaders[".debug_str"] = cs.Load
+	b.Config.Debugger = &compile.DebuggerSupport{Breakpoints: breakpoints}
 
-	reader := codeMap.Reader(bufio.NewReader(io.TeeReader(f, b.Image.ModuleWriter())))
+	reader := bufio.NewReader(io.TeeReader(f, b.Image.ModuleWriter()))
 
 	b.InstallEarlySnapshotLoaders()
 
@@ -402,9 +411,17 @@ func load(filename string, codeMap *debug.InsnMap, ns *section.NameSection, cs *
 		return
 	}
 
-	err = compile.LoadCodeSection(b.CodeConfig(codeMap), reader, b.Module, abi.Library())
+	codeReader := debug.NewReadTeller(reader)
+	err = compile.LoadCodeSection(b.CodeConfig(codeMap.Mapper(codeReader)), codeReader, b.Module, abi.Library())
 	if err != nil {
 		return
+	}
+
+	for offset, bp := range breakpoints {
+		if !bp.Set {
+			err = fmt.Errorf("breakpoint could not be set at offset 0x%x", offset)
+			return
+		}
 	}
 
 	text := prepareTextDump(b.Image.TextBuffer().Bytes())
@@ -497,18 +514,148 @@ func dump(prog *image.Program, inst *image.Instance, buffers snapshot.Buffers, s
 	return
 }
 
-func newDWARF(sections map[string][]byte) (data *dwarf.Data, err error) {
+func loadDebugInfo(r compile.Reader) (debugInfo *dwarf.Data, err error) {
 	var (
-		abbrev   = sections[".debug_abbrev"]
-		info     = sections[".debug_info"]
-		line     = sections[".debug_line"]
-		pubnames = sections[".debug_pubnames"]
-		ranges   = sections[".debug_ranges"]
-		str      = sections[".debug_str"]
+		smap   section.Map
+		custom section.CustomSections
 	)
 
-	if info != nil {
-		data, err = dwarf.New(abbrev, nil, nil, info, line, pubnames, ranges, str)
+	config := compile.Config{
+		SectionMapper: smap.Mapper(),
+		CustomSectionLoader: section.CustomLoader(map[string]section.CustomContentLoader{
+			".debug_abbrev":   custom.Load,
+			".debug_info":     custom.Load,
+			".debug_line":     custom.Load,
+			".debug_pubnames": custom.Load,
+			".debug_ranges":   custom.Load,
+			".debug_str":      custom.Load,
+		}),
 	}
+
+	_, err = compile.LoadInitialSections(&compile.ModuleConfig{Config: config}, r)
+	if err != nil && err != io.EOF {
+		return
+	}
+	err = nil
+
+	for id := section.Code; id <= section.Data; id++ {
+		_, err = section.CopyStandardSection(ioutil.Discard, r, id, config.CustomSectionLoader)
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+				break
+			}
+			return
+		}
+	}
+
+	err = compile.LoadCustomSections(&config, r)
+	if err != nil && err != io.EOF {
+		return
+	}
+	err = nil
+
+	var (
+		abbrev   = custom.Sections[".debug_abbrev"]
+		info     = custom.Sections[".debug_info"]
+		line     = custom.Sections[".debug_line"]
+		pubnames = custom.Sections[".debug_pubnames"]
+		ranges   = custom.Sections[".debug_ranges"]
+		str      = custom.Sections[".debug_str"]
+	)
+	if info == nil {
+		return
+	}
+
+	debugInfo, err = dwarf.New(abbrev, nil, nil, info, line, pubnames, ranges, str)
 	return
+}
+
+func parseBreakpoints(debugInfo *dwarf.Data) (map[uint32]compile.Breakpoint, error) {
+	type pair struct {
+		file string
+		line int
+	}
+
+	sourceLocations := make(map[pair]bool)
+	breakpoints := make(map[uint32]compile.Breakpoint)
+
+	for _, s := range c.Breakpoints {
+		if tokens := strings.SplitN(s, ":", 2); len(tokens) == 2 {
+			file := tokens[0]
+			line, err := strconv.Atoi(tokens[1])
+			if err == nil {
+				sourceLocations[pair{file, line}] = false
+				continue
+			}
+		}
+
+		if offset, err := strconv.ParseUint(s, 0, 32); err == nil {
+			breakpoints[uint32(offset)] = compile.Breakpoint{}
+			continue
+		}
+
+		return nil, fmt.Errorf("invalid breakpoint specification: %s", s)
+	}
+
+	if debugInfo != nil {
+		for r := debugInfo.Reader(); ; {
+			e, err := r.Next()
+			if err != nil {
+				return nil, err
+			}
+			if e == nil {
+				break
+			}
+
+			if e.Tag == dwarf.TagCompileUnit {
+				if e.Children {
+					lr, err := debugInfo.LineReader(e)
+					if err != nil {
+						return nil, err
+					}
+
+					if lr != nil {
+						var le dwarf.LineEntry
+
+						for {
+							if err := lr.Next(&le); err != nil {
+								if err == io.EOF {
+									break
+								}
+								return nil, err
+							}
+
+							if !le.IsStmt {
+								continue
+							}
+
+							p := pair{le.File.Name, le.Line}
+							if _, found := sourceLocations[p]; found {
+								fmt.Printf("breakpoint source location: [0x%x] %s:%d\n", le.Address, le.File.Name, le.Line)
+								breakpoints[uint32(le.Address)] = compile.Breakpoint{}
+								sourceLocations[p] = true
+							}
+						}
+					}
+				}
+			} else {
+				if e.Children {
+					r.SkipChildren()
+				}
+			}
+		}
+	}
+
+	for p, ok := range sourceLocations {
+		if !ok {
+			if debugInfo == nil {
+				return nil, errors.New("debug information is not available")
+			} else {
+				return nil, fmt.Errorf("source location not found: %s:%d", p.file, p.line)
+			}
+		}
+	}
+
+	return breakpoints, nil
 }
